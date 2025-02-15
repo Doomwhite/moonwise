@@ -1,78 +1,78 @@
-import os, requests, zipfile, sqlite3, argparse
+import sqlite3
+import argparse
+from datetime import datetime
+import os
+import re
 
-def webDAV_download(webdav_url, username, password, local_filename = None):
-    '''
-    Downloads a file from a WebDAV server given file URL, credentials, and local filename.
-    '''
-    response = requests.get(webdav_url, auth = (username, password), stream = True)
-    response.raise_for_status()  # Raise an error for bad status codes
+def format_timestamp(timestamp):
+    """
+    Convert a Unix timestamp (in milliseconds) to a human-readable date and time.
+    """
+    return datetime.fromtimestamp(timestamp / 1000).strftime("%Y-%m-%d %H:%M:%S")
 
-    if local_filename is None: local_filename = webdav_url.split('/')[-1]
-    with open(local_filename, 'wb') as file:
-        for chunk in response.iter_content(chunk_size = 8192):
-            file.write(chunk)
+def format_note_for_obsidian(timestamp, original, note):
+    """
+    Format the note for Obsidian Markdown.
+    """
+    formatted_note = f"### {timestamp}\n"
+    formatted_note += f"**Highlight:**\n{original}\n\n"
+    if note and note.strip():
+        formatted_note += f"**Comment:**\n{note}\n\n"
+    formatted_note += "---\n"
+    return formatted_note
 
-def is_in_note(s, note, _id, time):
-    return s in note or f'{_id}-{time}' in note
-
-def keep_highlight(s, highlightColor):
-    return 20 < len(s) < 700
+def sanitize_filename(book_name):
+    """
+    Sanitize the book name to make it a valid filename.
+    """
+    # Replace problematic characters with underscores
+    sanitized = re.sub(r'[\\/:*?"<>|]', '_', book_name)
+    # Remove leading/trailing whitespace and truncate to a reasonable length
+    return sanitized.strip()[:100]
 
 if __name__ == '__main__':
-
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description = 'Extract notes from Moon+ Reader backup.')
-    parser.add_argument('--webdav_url', type = str, help = 'WebDAV URL of Moon+ Reader backup.')
-    parser.add_argument('--username', type = str, help = 'WebDAV username.')
-    parser.add_argument('--password', type = str, help = 'WebDAV password.')
-    parser.add_argument('--note_path', type = str, help = 'WebDAV password.')
+    parser = argparse.ArgumentParser(description='Extract notes from Moon+ Reader backup.')
+    parser.add_argument('--db_path', type=str, required=True, help='Path to the mrbooks.db file.')
     args = parser.parse_args()
 
-    # Download backup zip file
-    local_filename = args.webdav_url.split('/')[-1]
-    webDAV_download(args.webdav_url, args.username, args.password, local_filename)
-    print(args)
-    print(f'Downloaded {args.webdav_url}')
-
-    # Unzip file and delete ZIP file
-    with zipfile.ZipFile(local_filename, 'r') as zip_ref:
-        zip_ref.extractall()
-        backup_dir = zip_ref.namelist()[0].split('/')[0]
-    os.remove(local_filename)
-    print(f'Unzipped {backup_dir}')
-
-    # Find main db (mrbooks.db) file path
-    with open(os.path.join(backup_dir, '_names.list'), 'r') as file:
-        line_number = next((i+1 for i, line in enumerate(file) if line.endswith('mrbooks.db\n')), None)
-        if line_number is None: 
-            print('Error: mrbooks.db not found in _names.list')
-            exit(1)
-    
-    db_path = os.path.join(backup_dir, f'{line_number}.tag')
-    print(f'Found mrbooks.db at {db_path}')
-
     # Get notes from db
-    with sqlite3.connect(db_path) as db:
+    with sqlite3.connect(args.db_path) as db:
         cursor = db.cursor()
-        cursor.execute('SELECT _id, book, highlightColor, time, original FROM notes WHERE original != "";')
+        cursor.execute('SELECT book, time, original, note, lastPosition FROM notes WHERE original != "";')
         notes = cursor.fetchall()
         print(f'Found {len(notes)} notes')
 
-    # Get previous note content
-    if os.path.exists(args.note_path):
-        with open(args.note_path, 'r') as f: prev_content = f.read()[:]
-    else:
-        with open(args.note_path, 'w+') as f: f.write('')
-        prev_content = ''
+    # Group notes by book and sort by lastPosition
+    books = {}
+    for (book, time, original, note, lastPosition) in notes:
+        if book not in books:
+            books[book] = []
+        formatted_time = format_timestamp(time)
+        books[book].append((lastPosition, formatted_time, original, note))
 
-    # Add new notes
-    first = True
-    with open(args.note_path, 'a') as f:
-        for (_id, book, highlightColor, time, original) in notes:
-            if not keep_highlight(original, highlightColor) or is_in_note(original, prev_content, _id, time):
-                continue
-            if first:
-                first = False
-                f.write('#flashcards\n')
-            f.write(f'%% {_id}-{time} %%\n{original}\n?\n*{book}*\n+++\n')
-            print(f'Added note {_id} from {book}: {original}')
+    # Sort notes within each book by lastPosition
+    for book in books:
+        books[book].sort(key=lambda x: x[0])  # Sort by lastPosition (first element in the tuple)
+
+    # Create a directory to store the files
+    output_dir = "moon_reader_notes"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Save notes to separate files for each book
+    for book, book_notes in books.items():
+        # Sanitize the book name to create a valid filename
+        sanitized_book_name = sanitize_filename(book)
+        output_filename = f"{sanitized_book_name}.md"
+        output_path = os.path.join(output_dir, output_filename)
+
+        # Write notes to the file
+        with open(output_path, "w", encoding="utf-8") as output_file:
+            output_file.write(f"# {book}\n\n")
+            for (lastPosition, timestamp, original, note) in book_notes:
+                output_file.write(format_note_for_obsidian(timestamp, original, note))
+            output_file.write("\n")  # Add a newline at the end
+
+        print(f"Saved notes for '{book}' to {output_path}")
+
+    print(f"All notes saved to the directory '{output_dir}'")
